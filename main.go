@@ -196,6 +196,7 @@ func (m *clientMgr) GetClient(ctx context.Context) (*ssh.Client, error) {
 						// Client was already replaced, just unlock and continue with the new one.
 						m.clientMux.Unlock()
 					}
+					return
 				}
 			case <-keepAliveStopper.Done():
 				return
@@ -212,6 +213,8 @@ func (m *clientMgr) GetClient(ctx context.Context) (*ssh.Client, error) {
 	return sshc, nil
 }
 
+// sendKeepAlive sends a keep-alive request to the SSH server and waits for a response or timeout.
+// Note that it leaks goroutines on timeout, but since we tear down the whole client on timeout, it shouldn't be a problem in practice.
 func sendKeepAlive(sshc *ssh.Client, timeout time.Duration) error {
 	keepAliveCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -307,7 +310,7 @@ func dialViaProxyJump(targetAddr string, targetConfig *ssh.ClientConfig, jumps [
 	clients := make([]*ssh.Client, 0, len(jumps)+1)
 
 	closeAll := func() {
-		for i := range clients {
+		for i := len(clients) - 1; i >= 0; i-- {
 			_ = clients[i].Close()
 		}
 	}
