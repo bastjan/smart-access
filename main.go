@@ -44,10 +44,9 @@ func main() {
 		if socket == "" {
 			log.Fatal("SSH_AUTH_SOCK is not set")
 		}
-		log.Printf("Using SSH agent socket: %s", socket)
 		agentSock = socket
 	}
-
+	log.Printf("Using SSH agent socket: %s", agentSock)
 	sshAgentConn, err := net.Dial("unix", agentSock)
 	if err != nil {
 		log.Fatalf("Failed to open SSH_AUTH_SOCK: %v", err)
