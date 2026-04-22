@@ -1,5 +1,7 @@
 # smart-access
 
+⚠️ PoC. Zero thought was put into connection supervision and teardown. "Just restart the dang thing."
+
 Smart cluster access solution tailored to VSHNs management of Kubernetes clusters over SSH jumphosts.
 
 Starts a socks5 proxy that automatically routes cluster domains of configured jumphosts.
