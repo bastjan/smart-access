@@ -20,17 +20,15 @@ import (
 )
 
 func main() {
+	log.Print("What part of trying to connect to Kubernetes clusters is a fucking living?")
+
 	if len(os.Args) < 2 {
 		log.Fatalf("Usage: %s mapping_file.json", os.Args[0])
 	}
 	mappingFile := os.Args[1]
-	mappingRaw, err := os.ReadFile(mappingFile)
+	hostnameMapping, err := loadHostnameMapping(mappingFile)
 	if err != nil {
-		log.Fatalf("Failed to read mapping file: %v", err)
-	}
-	var hostnameMapping map[string]string
-	if err := json.Unmarshal(mappingRaw, &hostnameMapping); err != nil {
-		log.Fatalf("Failed to parse mapping file: %v", err)
+		log.Fatalf("Failed to load hostname mapping: %v", err)
 	}
 
 	// ssh-agent(1) provides a UNIX socket at $SSH_AUTH_SOCK.
@@ -52,13 +50,13 @@ func main() {
 		agent:           agentClient,
 		hostnameMapping: hostnameMapping,
 
-		openSSHConnections: make(map[string]*ssh.Client),
+		sshManagers: make(map[string]*clientMgr),
 	}
 
 	socks5Server := &socks5.Server{
 		Logf: log.Printf,
 		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			log.Printf("Dialing %s://%s through proxy", network, addr)
+			log.Printf("New SOCKS5 connection %s://%s", network, addr)
 			return d.dial(ctx, network, addr)
 		},
 	}
@@ -73,14 +71,116 @@ func main() {
 	}
 }
 
+func loadHostnameMapping(mappingFile string) ([]hostSuffixJumphostMapping, error) {
+	mf, err := os.Open(mappingFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read mapping file: %w", err)
+	}
+	defer mf.Close()
+	var hmp map[string]string
+	if err := json.NewDecoder(mf).Decode(&hmp); err != nil {
+		return nil, fmt.Errorf("failed to parse mapping file: %w", err)
+	}
+	hostnameMapping := make([]hostSuffixJumphostMapping, 0, len(hmp))
+	for h, jh := range hmp {
+		hostnameMapping = append(hostnameMapping, hostSuffixJumphostMapping{
+			HostSuffix: h,
+			Jumphost:   jh,
+		})
+	}
+	// Longest suffix first, so that more specific mappings are preferred over less specific ones.
+	slices.SortFunc(hostnameMapping, func(a, b hostSuffixJumphostMapping) int {
+		return len(b.HostSuffix) - len(a.HostSuffix)
+	})
+	log.Printf("Loaded %v hostname mappings", len(hostnameMapping))
+	return hostnameMapping, nil
+}
+
+type hostSuffixJumphostMapping struct {
+	HostSuffix string
+	Jumphost   string
+}
+
 type sshDialer struct {
-	openSSHConnectionsMux sync.Mutex
-	openSSHConnections    map[string]*ssh.Client
+	sshManagersMux sync.Mutex
+	sshManagers    map[string]*clientMgr
+
+	routes sync.Map
 
 	agent           agent.ExtendedAgent
-	hostnameMapping map[string]string
+	hostnameMapping []hostSuffixJumphostMapping
 
 	directDialer net.Dialer
+}
+
+type clientMgr struct {
+	Jumphost string
+	Agent    agent.ExtendedAgent
+
+	clientMux sync.Mutex
+	client    *ssh.Client
+	cleanup   func()
+}
+
+func (m *clientMgr) GetClient(ctx context.Context) (*ssh.Client, error) {
+	m.clientMux.Lock()
+	defer m.clientMux.Unlock()
+
+	if m.client != nil {
+		return m.client, nil
+	}
+
+	// TODO(sebastian.widmer) Supervision, reconnection, teardown, younameit
+	jumphosts, err := jumphostChainForTarget(m.Jumphost)
+	if err != nil {
+		return nil, fmt.Errorf("error getting jumphost chain for %s: %w", m.Jumphost, err)
+	}
+
+	log.Printf("New connection to %s", strings.Join(jumphosts, "->"))
+	configs := make([]sshJump, 0, len(jumphosts))
+	for _, jh := range jumphosts {
+		jhAddr, jhConfig, err := configForHost(jh, m.Agent)
+		if err != nil {
+			return nil, fmt.Errorf("error getting SSH config for jumphost %s: %w", jh, err)
+		}
+		configs = append(configs, sshJump{
+			Addr:   jhAddr,
+			Config: jhConfig,
+		})
+	}
+
+	target := configs[len(configs)-1]
+	sshc, _, err := dialViaProxyJump(target.Addr, target.Config, configs[:len(configs)-1])
+	if err != nil {
+		return nil, fmt.Errorf("error dialing jumphost chain %s: %w", strings.Join(jumphosts, "->"), err)
+	}
+
+	m.client = sshc
+
+	return sshc, nil
+}
+
+func (d *sshDialer) jumphostForHost(hostname string) string {
+	if jh, ok := d.routes.Load(hostname); ok {
+		return jh.(string)
+	}
+
+	var jumphost string
+	for _, mapping := range d.hostnameMapping {
+		if strings.HasSuffix(hostname, mapping.HostSuffix) {
+			jumphost = mapping.Jumphost
+			break
+		}
+	}
+	d.routes.Store(hostname, jumphost)
+
+	if jumphost == "" {
+		log.Printf("⌥ %s is direct connection", hostname)
+	} else {
+		log.Printf("⌥ %s mapped to jumphost %s", hostname, jumphost)
+	}
+
+	return jumphost
 }
 
 func (d *sshDialer) dial(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -89,60 +189,24 @@ func (d *sshDialer) dial(ctx context.Context, network, addr string) (net.Conn, e
 		return nil, fmt.Errorf("error splitting host and port for %s: %w", addr, err)
 	}
 
-	var jumphost string
-	for h, jh := range d.hostnameMapping {
-		if strings.HasSuffix(hostname, h) {
-			jumphost = jh
-			break
-		}
-	}
+	jumphost := d.jumphostForHost(hostname)
 
 	if jumphost == "" {
-		log.Printf("No jumphosts configured for %s, dialing directly", addr)
 		return d.directDialer.DialContext(ctx, network, addr)
 	}
 
-	// TODO(sebastian.widmer) Per jumphost connection pooling to not block multiple connections on SSH connection setup.
-	getClient := func() (*ssh.Client, error) {
-		d.openSSHConnectionsMux.Lock()
-		defer d.openSSHConnectionsMux.Unlock()
-
-		existingSSH, ok := d.openSSHConnections[addr]
-		if ok {
-			log.Printf("Reusing existing SSH connection for %s", addr)
-			return existingSSH, nil
+	d.sshManagersMux.Lock()
+	mgr, ok := d.sshManagers[jumphost]
+	if !ok {
+		mgr = &clientMgr{
+			Jumphost: jumphost,
+			Agent:    d.agent,
 		}
-
-		jumphosts, err := jumphostChainForTarget(jumphost)
-		if err != nil {
-			return nil, fmt.Errorf("error getting jumphost chain for %s: %w", jumphost, err)
-		}
-
-		log.Printf("New connection for %s through jumphosts: %v", addr, strings.Join(jumphosts, "->"))
-		configs := make([]sshJump, 0, len(jumphosts))
-		for _, jh := range jumphosts {
-			jhAddr, jhConfig, err := configForHost(jh, d.agent)
-			if err != nil {
-				return nil, fmt.Errorf("error getting SSH config for jumphost %s: %w", jh, err)
-			}
-			configs = append(configs, sshJump{
-				Addr:   jhAddr,
-				Config: jhConfig,
-			})
-		}
-
-		target := configs[len(configs)-1]
-		sshc, _, err := dialViaProxyJump(target.Addr, target.Config, configs[:len(configs)-1])
-		if err != nil {
-			return nil, fmt.Errorf("error dialing target %s through jumphosts: %w", addr, err)
-		}
-
-		d.openSSHConnections[addr] = sshc
-
-		return sshc, nil
+		d.sshManagers[jumphost] = mgr
 	}
+	d.sshManagersMux.Unlock()
 
-	sshc, err := getClient()
+	sshc, err := mgr.GetClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("error getting SSH client for %s: %w", addr, err)
 	}
