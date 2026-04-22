@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
@@ -150,14 +151,72 @@ func (m *clientMgr) GetClient(ctx context.Context) (*ssh.Client, error) {
 	}
 
 	target := configs[len(configs)-1]
-	sshc, _, err := dialViaProxyJump(target.Addr, target.Config, configs[:len(configs)-1])
+	sshc, cleanupSSHC, err := dialViaProxyJump(target.Addr, target.Config, configs[:len(configs)-1])
 	if err != nil {
 		return nil, fmt.Errorf("error dialing jumphost chain %s: %w", strings.Join(jumphosts, "->"), err)
 	}
 
+	keepAliveStopper, stopKeepAlive := context.WithCancel(context.Background())
+	kat := time.NewTicker(5 * time.Second)
+	go func() {
+		defer kat.Stop()
+		for {
+			select {
+			case <-kat.C:
+				if err := sendKeepAlive(sshc, 3*time.Second); err != nil {
+					log.Printf("SSH keepalive failed for jumphost %s: %v", m.Jumphost, err)
+					kat.Stop()
+
+					m.clientMux.Lock()
+					if m.client != nil && m.client == sshc {
+						client := m.client
+						cleanup := m.cleanup
+
+						m.client = nil
+						m.cleanup = nil
+						m.clientMux.Unlock()
+
+						client.Close()
+						cleanup()
+					} else {
+						// Client was already replaced, just unlock and continue with the new one.
+						m.clientMux.Unlock()
+					}
+				}
+			case <-keepAliveStopper.Done():
+				return
+			}
+		}
+	}()
+
 	m.client = sshc
+	m.cleanup = func() {
+		stopKeepAlive()
+		cleanupSSHC()
+	}
 
 	return sshc, nil
+}
+
+func sendKeepAlive(sshc *ssh.Client, timeout time.Duration) error {
+	keepAliveCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		if _, _, err := sshc.SendRequest("keepalive@smart-access", true, nil); err != nil {
+			errCh <- fmt.Errorf("SSH keepalive failed: %w", err)
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case <-keepAliveCtx.Done():
+		return keepAliveCtx.Err()
+	case err := <-errCh:
+		return err
+	}
 }
 
 func (d *sshDialer) jumphostForHost(hostname string) string {

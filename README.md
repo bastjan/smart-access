@@ -1,6 +1,6 @@
 # smart-access
 
-⚠️ PoC. Zero thought was put into connection supervision and teardown. "Just restart the dang thing."
+⚠️ PoC. It does work nicely on my machine, even with network changes and reconnects, but I'm only ~50% sure about the stability of the keep-alive mechanism and connection tear-down. Only tested on MacOS so far.
 
 Smart cluster access solution tailored to VSHNs management of Kubernetes clusters over SSH jumphosts.
 
