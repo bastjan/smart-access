@@ -251,7 +251,7 @@ func (d *sshDialer) jumphostForHost(hostname string) string {
 	d.routes.Store(hostname, jumphost)
 
 	if jumphost == "" {
-		log.Printf("⌥ %s is direct connection", hostname)
+		log.Printf("⌥ %s is a direct connection", hostname)
 	} else {
 		log.Printf("⌥ %s mapped to jumphost %s", hostname, jumphost)
 	}
