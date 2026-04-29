@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -20,7 +22,9 @@ import (
 	"github.com/kevinburke/ssh_config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -99,13 +103,74 @@ func Test_loadHostnameMapping(t *testing.T) {
 }
 
 func Test_Start(t *testing.T) {
-	u := &ssh_config.UserSettings{}
-	u.ConfigFinder(func() string {
-		return filepath.Join("testdata", "jumphosts_config")
-	})
+	localhostZone := mockdns.Zone{A: []string{"127.0.0.1"}, AAAA: []string{"::1"}}
+	mockDNSServer, err := mockdns.NewServerWithLogger(map[string]mockdns.Zone{
+		"no.hop.":     localhostZone,
+		"one.hop.":    localhostZone,
+		"two.hops.":   localhostZone,
+		"three.hops.": localhostZone,
+	}, new(nopLogger), true)
+	require.NoError(t, err, "failed to start mock DNS server")
+	defer mockDNSServer.Close()
+	mockDNSResolver := &net.Resolver{}
+	mockDNSServer.PatchNet(mockDNSResolver)
+
 	userPubKey, agentSocket := spawnSSHAgent(t)
 	t.Logf("Spawned SSH agent with public key %x at socket %s", userPubKey, agentSocket)
-	t.Setenv("SSH_AUTH_SOCK", agentSocket)
+
+	allowedPubKey, err := ssh.NewPublicKey(userPubKey)
+	require.NoError(t, err)
+	jumphostDialer := net.Dialer{Resolver: mockDNSResolver}
+	jumpHost1 := spawnForwardingSSHServer(t, allowedPubKey, jumphostDialer)
+	jumpHost2 := spawnForwardingSSHServer(t, allowedPubKey, jumphostDialer)
+	jumpHost3 := spawnForwardingSSHServer(t, allowedPubKey, jumphostDialer)
+	knownHostsPath := writeKnownHostsFile(t, knownHostEntry{
+		hostname: "127.0.0.1",
+		port:     jumpHost1.Port(),
+		hostKey:  jumpHost1.HostKey(),
+	}, knownHostEntry{
+		hostname: "127.0.0.1",
+		port:     jumpHost2.Port(),
+		hostKey:  jumpHost2.HostKey(),
+	}, knownHostEntry{
+		hostname: "127.0.0.1",
+		port:     jumpHost3.Port(),
+		hostKey:  jumpHost3.HostKey(),
+	})
+
+	mappingPath := filepath.Join(t.TempDir(), "mapping.json")
+	require.NoError(t, os.WriteFile(mappingPath, requireJSONMarshal(t, map[string]string{
+		"one.hop":    "jumphost1",
+		"two.hops":   "jumphost2",
+		"three.hops": "jumphost3",
+	}), 0o600))
+
+	sshConfigPath := filepath.Join(t.TempDir(), "ssh_config")
+	require.NoError(t, os.WriteFile(sshConfigPath, []byte(fmt.Sprintf(`
+Host *
+	IdentityAgent %s
+	UserKnownHostsFile %s
+	User test
+
+Host jumphost1
+	HostName 127.0.0.1
+	Port %d
+
+Host jumphost2
+	HostName 127.0.0.1
+	ProxyJump jumphost1
+	Port %d
+
+Host jumphost3
+	HostName 127.0.0.1
+	ProxyJump jumphost2
+	Port %d
+`, agentSocket, knownHostsPath, jumpHost1.Port(), jumpHost2.Port(), jumpHost3.Port())), 0o600))
+
+	u := &ssh_config.UserSettings{}
+	u.ConfigFinder(func() string {
+		return sshConfigPath
+	})
 
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
@@ -114,17 +179,7 @@ func Test_Start(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer httpServer.Close()
-
-	mockDNSServer, err := mockdns.NewServerWithLogger(map[string]mockdns.Zone{
-		"my-cluster.net.": {
-			A:    []string{"127.0.0.1"},
-			AAAA: []string{"::1"},
-		},
-	}, new(nopLogger), true)
-	require.NoError(t, err, "failed to start mock DNS server")
-	defer mockDNSServer.Close()
-	mockDNSResolver := &net.Resolver{}
-	mockDNSServer.PatchNet(mockDNSResolver)
+	httpServerPort := httpServer.Listener.Addr().(*net.TCPAddr).Port
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -140,7 +195,7 @@ func Test_Start(t *testing.T) {
 				Resolver: mockDNSResolver,
 			},
 		}
-		return p.Start(wgCtx, proxyAddr, "testdata/mapping.json")
+		return p.Start(wgCtx, proxyAddr, mappingPath)
 	})
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -151,7 +206,7 @@ func Test_Start(t *testing.T) {
 		Transport: transport,
 	}
 	require.EventuallyWithT(t, func(t *assert.CollectT) {
-		httpReq, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://my-cluster.net:%d", httpServer.Listener.Addr().(*net.TCPAddr).Port), nil)
+		httpReq, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://no.hop:%d", httpServerPort), nil)
 		require.NoError(t, err)
 		resp, err := client.Do(httpReq)
 		require.NoError(t, err)
@@ -159,9 +214,163 @@ func Test_Start(t *testing.T) {
 		resp.Body.Close()
 	}, 5*time.Second, 100*time.Millisecond, "proxy did not start in time")
 
-	cancel()
+	for _, domain := range []string{"no.hop", "one.hop", "two.hops", "three.hops"} {
+		httpReq, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s:%d", domain, httpServerPort), nil)
+		require.NoError(t, err)
+		resp, err := client.Do(httpReq)
+		require.NoError(t, err)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
 
+	cancel()
 	require.NoError(t, wg.Wait())
+}
+
+func requireJSONMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
+}
+
+type knownHostEntry struct {
+	hostname string
+	port     int
+	hostKey  ssh.PublicKey
+}
+
+func writeKnownHostsFile(t *testing.T, entries ...knownHostEntry) string {
+	t.Helper()
+
+	p := filepath.Join(t.TempDir(), "known_hosts")
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	require.NoError(t, err)
+	defer f.Close()
+
+	for _, entry := range entries {
+		line := knownhosts.Line([]string{net.JoinHostPort(entry.hostname, strconv.Itoa(entry.port))}, entry.hostKey)
+		_, err := f.WriteString(line + "\n")
+		require.NoError(t, err)
+	}
+
+	return p
+}
+
+type forwardingSSHServer struct {
+	hostKey ssh.PublicKey
+	addr    *net.TCPAddr
+}
+
+func spawnForwardingSSHServer(t *testing.T, allowedClientPubKey ssh.PublicKey, dialer net.Dialer) *forwardingSSHServer {
+	t.Helper()
+
+	_, hostPrivate, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	hostSigner, err := ssh.NewSignerFromKey(hostPrivate)
+	require.NoError(t, err)
+
+	serverConfig := &ssh.ServerConfig{
+		PublicKeyCallback: func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), allowedClientPubKey.Marshal()) {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("unauthorized client key")
+		},
+	}
+	serverConfig.AddHostKey(hostSigner)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	s := &forwardingSSHServer{
+		hostKey: hostSigner.PublicKey(),
+		addr:    ln.Addr().(*net.TCPAddr),
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go handleSSHForwardingConnection(conn, serverConfig, dialer)
+		}
+	}()
+
+	t.Cleanup(func() {
+		require.NoError(t, ln.Close())
+	})
+
+	return s
+}
+
+func (s *forwardingSSHServer) Port() int {
+	return s.addr.Port
+}
+
+func (s *forwardingSSHServer) HostKey() ssh.PublicKey {
+	return s.hostKey
+}
+
+func handleSSHForwardingConnection(rawConn net.Conn, conf *ssh.ServerConfig, dialer net.Dialer) {
+	defer rawConn.Close()
+
+	_, chans, reqs, err := ssh.NewServerConn(rawConn, conf)
+	if err != nil {
+		return
+	}
+
+	go ssh.DiscardRequests(reqs)
+
+	for newChannel := range chans {
+		if newChannel.ChannelType() != "direct-tcpip" {
+			_ = newChannel.Reject(ssh.UnknownChannelType, "unsupported channel type")
+			continue
+		}
+
+		var req struct {
+			DestAddr   string
+			DestPort   uint32
+			OriginAddr string
+			OriginPort uint32
+		}
+		if err := ssh.Unmarshal(newChannel.ExtraData(), &req); err != nil {
+			_ = newChannel.Reject(ssh.ConnectionFailed, "invalid direct-tcpip payload")
+			continue
+		}
+
+		targetConn, err := dialer.Dial("tcp", net.JoinHostPort(req.DestAddr, strconv.Itoa(int(req.DestPort))))
+		if err != nil {
+			_ = newChannel.Reject(ssh.ConnectionFailed, err.Error())
+			continue
+		}
+
+		sshChannel, channelRequests, err := newChannel.Accept()
+		if err != nil {
+			targetConn.Close()
+			continue
+		}
+		go ssh.DiscardRequests(channelRequests)
+
+		go func() {
+			defer sshChannel.Close()
+			defer targetConn.Close()
+
+			errCh := make(chan struct{}, 2)
+			go func() {
+				_, _ = io.Copy(sshChannel, targetConn)
+				errCh <- struct{}{}
+			}()
+			go func() {
+				_, _ = io.Copy(targetConn, sshChannel)
+				errCh <- struct{}{}
+			}()
+			<-errCh
+		}()
+	}
 }
 
 // freePort returns a free port on the host.
@@ -192,8 +401,7 @@ func spawnSSHAgent(t *testing.T) (pub ed25519.PublicKey, socketPath string) {
 
 	require.NoError(t, ag.Add(agent.AddedKey{PrivateKey: priv}))
 
-	tmp := t.TempDir()
-	socketPath = tmp + "/agent.sock"
+	socketPath = t.TempDir() + "/agent.sock"
 	ln, err := net.Listen("unix", socketPath)
 	require.NoError(t, err, "spawnSSHAgent: listen on unix socket")
 
@@ -209,7 +417,6 @@ func spawnSSHAgent(t *testing.T) (pub ed25519.PublicKey, socketPath string) {
 
 	t.Cleanup(func() {
 		require.NoError(t, ln.Close())
-		require.NoError(t, os.RemoveAll(tmp))
 	})
 
 	return pub, socketPath
