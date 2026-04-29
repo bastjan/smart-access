@@ -6,6 +6,7 @@ import (
 
 	"github.com/kevinburke/ssh_config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func Test_jumphostChainForTarget(t *testing.T) {
@@ -63,7 +64,7 @@ func Test_jumphostChainForTarget(t *testing.T) {
 				assert.ErrorContains(t, err, tt.wantErrMatching)
 				return
 			}
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -71,7 +72,7 @@ func Test_jumphostChainForTarget(t *testing.T) {
 
 func Test_loadHostnameMapping(t *testing.T) {
 	loaded, err := loadHostnameMapping(filepath.Join("testdata", "mapping.json"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, []hostSuffixJumphostMapping{
 		{HostSuffix: "api.c-bettersmarter-prod01.vshnmanaged.net", Jumphost: "jumphost2"},
 		{HostSuffix: "c-bettersmarter-prod01.vshnmanaged.net", Jumphost: "jumphost1"},
