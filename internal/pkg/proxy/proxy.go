@@ -22,10 +22,24 @@ import (
 	"tailscale.com/net/socks5"
 )
 
-func Start(ctx context.Context, addr, mappingFile string, sshConfig *ssh_config.UserSettings) error {
+type Proxy struct {
+	// SSHConfig is the SSH config to use for determining jumphosts and SSH connection settings.
+	// If not set, the proxy uses ssh_config.DefaultUserSettings.
+	SSHConfig *ssh_config.UserSettings
+
+	// DirectDialer is the dialer to use for direct connections.
+	DirectDialer net.Dialer
+}
+
+func (p *Proxy) Start(ctx context.Context, addr, mappingFile string) error {
 	hostnameMapping, err := loadHostnameMapping(mappingFile)
 	if err != nil {
 		return fmt.Errorf("failed to load hostname mapping: %w", err)
+	}
+
+	sshConfig := p.SSHConfig
+	if sshConfig == nil {
+		sshConfig = ssh_config.DefaultUserSettings
 	}
 
 	// TODO(sebastian.widmer) This can in theory be different for different jumphosts, but let's assume it's the same for all of them for now.
@@ -63,7 +77,8 @@ func Start(ctx context.Context, addr, mappingFile string, sshConfig *ssh_config.
 
 		sshManagers: make(map[string]*clientMgr),
 
-		sshSettings: sshConfig,
+		sshSettings:  sshConfig,
+		directDialer: p.DirectDialer,
 	}
 
 	socks5Server := &socks5.Server{

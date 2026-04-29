@@ -7,7 +7,6 @@ import (
 	"os/signal"
 
 	"github.com/bastjan/smart-access/internal/pkg/proxy"
-	"github.com/kevinburke/ssh_config"
 )
 
 func main() {
@@ -20,7 +19,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	if err := proxy.Start(ctx, "127.0.0.1:12000", os.Args[1], ssh_config.DefaultUserSettings); err != nil {
+	var proxy proxy.Proxy
+	if err := proxy.Start(ctx, "127.0.0.1:12000", os.Args[1]); err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/foxcpp/go-mockdns"
 	"github.com/kevinburke/ssh_config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -113,6 +115,17 @@ func Test_Start(t *testing.T) {
 	}))
 	defer httpServer.Close()
 
+	mockDNSServer, err := mockdns.NewServerWithLogger(map[string]mockdns.Zone{
+		"my-cluster.net.": {
+			A:    []string{"127.0.0.1"},
+			AAAA: []string{"::1"},
+		},
+	}, new(nopLogger), true)
+	require.NoError(t, err, "failed to start mock DNS server")
+	defer mockDNSServer.Close()
+	mockDNSResolver := &net.Resolver{}
+	mockDNSServer.PatchNet(mockDNSResolver)
+
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
@@ -121,7 +134,13 @@ func Test_Start(t *testing.T) {
 	proxyAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(proxyPort))
 	wg, wgCtx := errgroup.WithContext(ctx)
 	wg.Go(func() error {
-		return Start(wgCtx, proxyAddr, "testdata/mapping.json", u)
+		p := Proxy{
+			SSHConfig: u,
+			DirectDialer: net.Dialer{
+				Resolver: mockDNSResolver,
+			},
+		}
+		return p.Start(wgCtx, proxyAddr, "testdata/mapping.json")
 	})
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -132,7 +151,9 @@ func Test_Start(t *testing.T) {
 		Transport: transport,
 	}
 	require.EventuallyWithT(t, func(t *assert.CollectT) {
-		resp, err := client.Get(httpServer.URL)
+		httpReq, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://my-cluster.net:%d", httpServer.Listener.Addr().(*net.TCPAddr).Port), nil)
+		require.NoError(t, err)
+		resp, err := client.Do(httpReq)
 		require.NoError(t, err)
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
@@ -193,3 +214,7 @@ func spawnSSHAgent(t *testing.T) (pub ed25519.PublicKey, socketPath string) {
 
 	return pub, socketPath
 }
+
+type nopLogger struct{}
+
+func (l *nopLogger) Printf(format string, args ...interface{}) {}
