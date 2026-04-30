@@ -22,6 +22,8 @@ import (
 	"tailscale.com/net/socks5"
 )
 
+const keepAliveRequestType = "keepalive@smart-access"
+
 type Proxy struct {
 	// SSHConfig is the SSH config to use for determining jumphosts and SSH connection settings.
 	// If not set, the proxy uses ssh_config.DefaultUserSettings.
@@ -29,6 +31,10 @@ type Proxy struct {
 
 	// DirectDialer is the dialer to use for direct connections.
 	DirectDialer net.Dialer
+
+	// KeepAliveInterval is the interval for sending keep-alive messages to the jumphosts.
+	// Defaults to 3 seconds if not set.
+	KeepAliveInterval time.Duration
 }
 
 func (p *Proxy) Start(ctx context.Context, addr, mappingFile string) error {
@@ -77,8 +83,9 @@ func (p *Proxy) Start(ctx context.Context, addr, mappingFile string) error {
 
 		sshManagers: make(map[string]*clientMgr),
 
-		sshSettings:  sshConfig,
-		directDialer: p.DirectDialer,
+		sshSettings:       sshConfig,
+		directDialer:      p.DirectDialer,
+		keepAliveInterval: p.keepAliveInterval(),
 	}
 
 	socks5Server := &socks5.Server{
@@ -108,6 +115,14 @@ func (p *Proxy) Start(ctx context.Context, addr, mappingFile string) error {
 	})
 
 	return eg.Wait()
+}
+
+// keepAliveInterval returns the keep-alive interval to use for SSH connections, defaulting to 3 seconds if not set.
+func (p *Proxy) keepAliveInterval() time.Duration {
+	if p.KeepAliveInterval == 0 {
+		return 3 * time.Second
+	}
+	return p.KeepAliveInterval
 }
 
 func loadHostnameMapping(mappingFile string) ([]hostSuffixJumphostMapping, error) {
@@ -151,13 +166,15 @@ type sshDialer struct {
 
 	sshSettings *ssh_config.UserSettings
 
-	directDialer net.Dialer
+	directDialer      net.Dialer
+	keepAliveInterval time.Duration
 }
 
 type clientMgr struct {
-	Jumphost    string
-	Agent       agent.ExtendedAgent
-	SSHSettings *ssh_config.UserSettings
+	Jumphost          string
+	Agent             agent.ExtendedAgent
+	SSHSettings       *ssh_config.UserSettings
+	KeepAliveInterval time.Duration
 
 	clientMux sync.Mutex
 	client    *ssh.Client
@@ -172,7 +189,6 @@ func (m *clientMgr) GetClient(ctx context.Context) (*ssh.Client, error) {
 		return m.client, nil
 	}
 
-	// TODO(sebastian.widmer) Supervision, reconnection, teardown, younameit
 	jumphosts, err := jumphostChainForTarget(m.SSHSettings, m.Jumphost)
 	if err != nil {
 		return nil, fmt.Errorf("error getting jumphost chain for %s: %w", m.Jumphost, err)
@@ -198,13 +214,13 @@ func (m *clientMgr) GetClient(ctx context.Context) (*ssh.Client, error) {
 	}
 
 	keepAliveStopper, stopKeepAlive := context.WithCancel(context.Background())
-	kat := time.NewTicker(5 * time.Second)
+	kat := time.NewTicker(m.KeepAliveInterval)
 	go func() {
 		defer kat.Stop()
 		for {
 			select {
 			case <-kat.C:
-				if err := sendKeepAlive(sshc, 3*time.Second); err != nil {
+				if err := sendKeepAlive(sshc, m.KeepAliveInterval); err != nil {
 					log.Printf("SSH keepalive failed for jumphost %s: %v", m.Jumphost, err)
 					kat.Stop()
 
@@ -248,7 +264,7 @@ func sendKeepAlive(sshc *ssh.Client, timeout time.Duration) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		if _, _, err := sshc.SendRequest("keepalive@smart-access", true, nil); err != nil {
+		if _, _, err := sshc.SendRequest(keepAliveRequestType, true, nil); err != nil {
 			errCh <- fmt.Errorf("SSH keepalive failed: %w", err)
 			return
 		}
@@ -302,9 +318,10 @@ func (d *sshDialer) dial(ctx context.Context, network, addr string) (net.Conn, e
 	mgr, ok := d.sshManagers[jumphost]
 	if !ok {
 		mgr = &clientMgr{
-			Jumphost:    jumphost,
-			Agent:       d.agent,
-			SSHSettings: d.sshSettings,
+			Jumphost:          jumphost,
+			Agent:             d.agent,
+			SSHSettings:       d.sshSettings,
+			KeepAliveInterval: d.keepAliveInterval,
 		}
 		d.sshManagers[jumphost] = mgr
 	}

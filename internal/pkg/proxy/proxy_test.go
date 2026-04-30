@@ -6,8 +6,10 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -104,6 +107,8 @@ func Test_loadHostnameMapping(t *testing.T) {
 }
 
 func Test_Start(t *testing.T) {
+	ev := eventuallyDefaults{waitFor: 5 * time.Second, interval: 100 * time.Millisecond}
+
 	userPubKey, agentSocket := spawnSSHAgent(t)
 	t.Logf("Spawned SSH agent with public key %x at socket %s", userPubKey, agentSocket)
 
@@ -121,7 +126,7 @@ func Test_Start(t *testing.T) {
 		port:     jumpHost1.Port(),
 		hostKey:  jumpHost1.HostKey(),
 	}, knownHostEntry{
-		hostname: "127.0.0.1",
+		hostname: "jumphost2",
 		port:     jumpHost2.Port(),
 		hostKey:  jumpHost2.HostKey(),
 	}, knownHostEntry{
@@ -150,6 +155,7 @@ Host jumphost1
 
 Host jumphost2
 	HostName 127.0.0.1
+	HostKeyAlias jumphost2
 	ProxyJump jumphost1
 	Port %d
 
@@ -170,7 +176,6 @@ Host jumphost3
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer httpServer.Close()
-	httpServerPort := httpServer.Listener.Addr().(*net.TCPAddr).Port
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -185,37 +190,85 @@ Host jumphost3
 			DirectDialer: net.Dialer{
 				Resolver: localDNSResolver,
 			},
+			KeepAliveInterval: 100 * time.Millisecond,
 		}
 		return p.Start(wgCtx, proxyAddr, mappingPath)
 	})
 
+	httpClient := newHTTPClient(proxyAddr, httpServer.Listener.Addr().(*net.TCPAddr).Port)
+	ev.requireEventuallyWithT(t, func(t *assert.CollectT) {
+		httpClient.RequireSuccessfulGet(t, "http://no.hop")
+	}, "proxy did not start in time")
+
+	for _, domain := range []string{"no.hop", "one.hop", "two.hops", "three.hops"} {
+		httpClient.RequireSuccessfulGet(t, fmt.Sprintf("http://%s", domain))
+	}
+
+	ev.requireEventuallyWithT(t, func(t *assert.CollectT) {
+		assert.GreaterOrEqual(t, jumpHost1.KeepAliveCount(), uint64(1), "expected at least 1 keep-alive request to jumpHost1")
+		assert.GreaterOrEqual(t, jumpHost2.KeepAliveCount(), uint64(1), "expected at least 1 keep-alive request to jumpHost2")
+		assert.GreaterOrEqual(t, jumpHost3.KeepAliveCount(), uint64(1), "expected at least 1 keep-alive request to jumpHost3")
+	}, "keep-alive requests were not received in time")
+
+	require.GreaterOrEqual(t, jumpHost3.AuthenticatedConnections(), int64(1), "precondition failed: expected at least 1 authenticated connection to jumpHost3")
+	jumpHost3.BlockKeepAlives()
+
+	ev.requireEventuallyWithT(t, func(t *assert.CollectT) {
+		assert.Equal(t, int64(0), jumpHost3.AuthenticatedConnections())
+	}, "expected no authenticated connections to jumpHost3 after blocking keep-alives")
+
+	jumpHost3.UnblockKeepAlives()
+	ev.requireEventuallyWithT(t, func(t *assert.CollectT) {
+		httpClient.RequireSuccessfulGet(t, "http://three.hops")
+	}, "proxy did not start in time")
+
+	cancel()
+	require.NoError(t, wg.Wait())
+}
+
+type eventuallyDefaults struct {
+	waitFor  time.Duration
+	interval time.Duration
+}
+
+func (e eventuallyDefaults) requireEventuallyWithT(t *testing.T, condition func(collect *assert.CollectT), msgAndArgs ...any) {
+	t.Helper()
+	require.EventuallyWithT(t, condition, e.waitFor, e.interval, msgAndArgs...)
+}
+
+type httpClient struct {
+	client         *http.Client
+	httpServerPort int
+}
+
+func newHTTPClient(proxyAddr string, httpServerPort int) *httpClient {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = func(req *http.Request) (*url.URL, error) {
 		return url.Parse("socks5://" + proxyAddr)
 	}
-	client := &http.Client{
-		Transport: transport,
+	return &httpClient{
+		client: &http.Client{
+			Transport: transport,
+		},
+		httpServerPort: httpServerPort,
 	}
-	require.EventuallyWithT(t, func(t *assert.CollectT) {
-		httpReq, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://no.hop:%d", httpServerPort), nil)
-		require.NoError(t, err)
-		resp, err := client.Do(httpReq)
-		require.NoError(t, err)
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}, 5*time.Second, 100*time.Millisecond, "proxy did not start in time")
+}
 
-	for _, domain := range []string{"no.hop", "one.hop", "two.hops", "three.hops"} {
-		httpReq, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s:%d", domain, httpServerPort), nil)
-		require.NoError(t, err)
-		resp, err := client.Do(httpReq)
-		require.NoError(t, err)
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}
+// RequireSuccessfulGet performs a GET request to the given URL and requires that it succeeds with a 2xx status code.
+// It auto-injects the port of the test HTTP server into the URL and uses the client's SOCKS5 proxy configuration to perform the request.
+func (c *httpClient) RequireSuccessfulGet(t require.TestingT, urlStr string) {
+	u, err := url.Parse(urlStr)
+	require.NoError(t, err)
+	u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(c.httpServerPort))
 
-	cancel()
-	require.NoError(t, wg.Wait())
+	httpReq, err := http.NewRequestWithContext(context.Background(), "GET", u.String(), nil)
+	require.NoError(t, err)
+	resp, err := c.client.Do(httpReq)
+	require.NoError(t, err)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	require.True(t, resp.StatusCode >= 200 && resp.StatusCode < 300, "expected successful response, got %d", resp.StatusCode)
 }
 
 func requireJSONMarshal(t *testing.T, v any) []byte {
@@ -249,17 +302,46 @@ func writeKnownHostsFile(t *testing.T, entries ...knownHostEntry) string {
 	return p
 }
 
-type forwardingSSHServer struct {
+type mockSSHServer struct {
 	hostKey ssh.PublicKey
 	addr    *net.TCPAddr
+
+	blockKeepAlives               atomic.Bool
+	keepAliveCounter              atomic.Uint64
+	authenticatedConnectionsGauge atomic.Int64
+}
+
+func (s *mockSSHServer) Port() int {
+	return s.addr.Port
+}
+
+func (s *mockSSHServer) HostKey() ssh.PublicKey {
+	return s.hostKey
+}
+
+func (s *mockSSHServer) BlockKeepAlives() {
+	s.blockKeepAlives.Store(true)
+}
+
+func (s *mockSSHServer) UnblockKeepAlives() {
+	s.blockKeepAlives.Store(false)
+}
+
+func (s *mockSSHServer) KeepAliveCount() uint64 {
+	return s.keepAliveCounter.Load()
+}
+
+func (s *mockSSHServer) AuthenticatedConnections() int64 {
+	return s.authenticatedConnectionsGauge.Load()
 }
 
 // spawnForwardingSSHServer starts an SSH server that accepts connections using the allowedClientPubKey.
 // It supports only "direct-tcpip" channels and forwards them to the requested destination using the provided dialer.
+// The server responds to keep-alive requests (of type `keepAliveRequestType`) and increments the keepAliveCounter, unless keep-alives are blocked.
 // All other unsupported SSH features (like exec or shell channels) are rejected.
 // The server listens on a random free port on localhost and uses a randomly generated host key.
 // The server is shut down when the test ends.
-func spawnForwardingSSHServer(t *testing.T, allowedClientPubKey ssh.PublicKey, dialer net.Dialer) *forwardingSSHServer {
+func spawnForwardingSSHServer(t *testing.T, allowedClientPubKey ssh.PublicKey, dialer net.Dialer) *mockSSHServer {
 	t.Helper()
 
 	_, hostPrivate, err := ed25519.GenerateKey(rand.Reader)
@@ -281,45 +363,59 @@ func spawnForwardingSSHServer(t *testing.T, allowedClientPubKey ssh.PublicKey, d
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	s := &forwardingSSHServer{
+	s := &mockSSHServer{
 		hostKey: hostSigner.PublicKey(),
 		addr:    ln.Addr().(*net.TCPAddr),
 	}
 
-	go func() {
+	var wg errgroup.Group
+	wg.Go(func() error {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				return
+				if errors.Is(err, net.ErrClosed) {
+					return nil
+				}
+				return fmt.Errorf("accepting SSH connection: %w", err)
 			}
-			go handleSSHForwardingConnection(conn, serverConfig, dialer)
+			go s.handleSSHForwardingConnection(conn, serverConfig, dialer)
 		}
-	}()
+	})
 
 	t.Cleanup(func() {
 		require.NoError(t, ln.Close())
+		require.NoError(t, wg.Wait(), "waiting for SSH server goroutine to finish")
 	})
 
 	return s
 }
 
-func (s *forwardingSSHServer) Port() int {
-	return s.addr.Port
-}
-
-func (s *forwardingSSHServer) HostKey() ssh.PublicKey {
-	return s.hostKey
-}
-
-func handleSSHForwardingConnection(rawConn net.Conn, conf *ssh.ServerConfig, dialer net.Dialer) {
+func (s *mockSSHServer) handleSSHForwardingConnection(rawConn net.Conn, conf *ssh.ServerConfig, dialer net.Dialer) {
 	defer rawConn.Close()
 
 	_, chans, reqs, err := ssh.NewServerConn(rawConn, conf)
 	if err != nil {
+		log.Printf("SSH handshake failed: %v", err)
 		return
 	}
 
-	go ssh.DiscardRequests(reqs)
+	s.authenticatedConnectionsGauge.Add(1)
+	defer s.authenticatedConnectionsGauge.Add(-1)
+
+	go func() {
+		for req := range reqs {
+			if req.Type == keepAliveRequestType {
+				if s.blockKeepAlives.Load() {
+					continue
+				}
+
+				s.keepAliveCounter.Add(1)
+				req.Reply(true, nil)
+			} else {
+				req.Reply(false, nil)
+			}
+		}
+	}()
 
 	for newChannel := range chans {
 		if newChannel.ChannelType() != "direct-tcpip" {
