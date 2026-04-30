@@ -1,5 +1,7 @@
 # smart-access
 
+🧱 smart-access is now developed as [vshn/kharon](https://github.com/vshn/kharon).
+
 Smart cluster access solution tailored to VSHNs management of Kubernetes clusters over SSH jumphosts.
 
 Starts a socks5 proxy that automatically routes cluster domains of configured jumphosts.
